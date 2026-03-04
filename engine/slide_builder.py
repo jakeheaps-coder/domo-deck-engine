@@ -1,7 +1,7 @@
 """
 Slide builder — loads the real DOMO_BRAND FORMAT TEMPLATE and populates
-its native placeholders. All design (fonts, colors, backgrounds, logos,
-shapes) comes from the template — we only inject content.
+placeholders. The AI picks layout_index per slide from the full 309-layout
+catalog, so this builder is generic — it works with ANY layout.
 """
 
 import io
@@ -9,55 +9,59 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 from pptx import Presentation
-from pptx.util import Inches
 from pptx.oxml.ns import qn
 
 from config import TEMPLATES_DIR
-from models.deck_config import DESIGN_STYLES, TEMPLATE_STYLE_MAP
 
 TEMPLATE_PATH = TEMPLATES_DIR / "domo_brand_template.pptx"
 
 
 def build_presentation(
     slides: List[Dict[str, Any]],
-    design_style: str = "executive_blue",
     image_map: Optional[Dict[int, str]] = None,
     title: str = "Untitled",
+    **kwargs,
 ) -> bytes:
     """
-    Build a .pptx by loading the real Domo template and populating placeholders.
-
-    Args:
-        slides: List of slide content dicts
-        design_style: "executive_blue" | "clean_white" | "gradient"
-        image_map: {slide_position: image_path}
-        title: Deck title (for metadata)
-
-    Returns:
-        .pptx file as bytes
+    Build a .pptx by loading the real Domo template.
+    Each slide dict must have 'layout_index' (0-308) picked by the AI.
     """
     image_map = image_map or {}
-    style = DESIGN_STYLES.get(design_style, DESIGN_STYLES["executive_blue"])
 
-    # Load the template (preserves all masters, themes, fonts, colors)
     prs = Presentation(str(TEMPLATE_PATH))
-
-    # Clear all 1085 example slides — keep only layouts
     _clear_slides(prs)
 
-    # Build each slide using the correct layout
-    for sd in slides:
-        slide_type = sd.get("slide_type", "bullets")
-        position = sd.get("position", 0)
-        img = image_map.get(position)
+    total_layouts = len(prs.slide_layouts)
 
-        # Resolve the layout index from the design style
-        layout_idx = style.get(slide_type, style.get("bullets", 12))
+    for sd in slides:
+        layout_idx = sd.get("layout_index", 12)
+        if layout_idx < 0 or layout_idx >= total_layouts:
+            layout_idx = 12  # Fallback to basic bullets
+
         layout = prs.slide_layouts[layout_idx]
         slide = prs.slides.add_slide(layout)
 
-        # Populate based on slide type
-        _populate_slide(slide, sd, slide_type, layout_idx, img)
+        # Get available placeholders
+        phs = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
+
+        # PRIMARY: Use placeholder_map if AI provided it
+        ph_map = sd.get("placeholder_map", {})
+        if ph_map:
+            for idx_str, content in ph_map.items():
+                idx = int(idx_str)
+                if idx in phs and content:
+                    _set_placeholder(phs[idx], content)
+
+        # FALLBACK: Use structured fields to populate common placeholders
+        _populate_from_fields(phs, sd, image_map.get(sd.get("position", 0)))
+
+        # Speaker notes
+        notes = sd.get("speaker_notes", "")
+        if notes:
+            try:
+                slide.notes_slide.notes_text_frame.text = notes
+            except Exception:
+                pass
 
     buf = io.BytesIO()
     prs.save(buf)
@@ -65,7 +69,7 @@ def build_presentation(
 
 
 def _clear_slides(prs: Presentation):
-    """Remove all existing slides from the presentation (keep layouts only)."""
+    """Remove all existing slides from the presentation."""
     sldIdLst = prs.slides._sldIdLst
     while len(sldIdLst):
         rId = sldIdLst[0].get(qn('r:id'))
@@ -74,224 +78,88 @@ def _clear_slides(prs: Presentation):
         del sldIdLst[0]
 
 
-def _populate_slide(slide, data: Dict, slide_type: str, layout_idx: int, image_path: Optional[str]):
-    """Populate a slide's placeholders based on its type."""
-    phs = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
-
-    if slide_type == "title":
-        _populate_title(phs, data)
-    elif slide_type == "section":
-        _populate_section(phs, data)
-    elif slide_type in ("quote",):
-        _populate_quote(phs, data, layout_idx)
-    elif slide_type == "bullets":
-        _populate_bullets(phs, data)
-    elif slide_type in ("one_column", "paragraph"):
-        _populate_one_column(phs, data)
-    elif slide_type in ("two_column", "emphasis_2col"):
-        _populate_two_column(phs, data)
-    elif slide_type in ("text_image", "large_image", "text_landscape",
-                         "phone_mockup", "screen_mockup", "intro_image"):
-        _populate_text_image(phs, data, image_path)
-    elif slide_type == "emphasis":
-        _populate_emphasis(phs, data)
-    elif slide_type in ("icons_1", "icons_2", "icons_3",
-                         "icons_1_desc", "icons_2_desc", "icons_3_desc"):
-        _populate_icons(phs, data, slide_type)
-    elif slide_type == "agenda":
-        _populate_agenda(phs, data, image_path)
-    elif slide_type == "close":
-        _populate_close(phs, data)
-    else:
-        # Fallback: try to populate whatever placeholders exist
-        _populate_generic(phs, data)
-
-    # Add speaker notes if provided
-    notes = data.get("speaker_notes", "")
-    if notes and hasattr(slide, 'notes_slide'):
-        try:
-            notes_slide = slide.notes_slide
-            notes_slide.notes_text_frame.text = notes
-        except Exception:
-            pass
+def _set_placeholder(ph, content: str):
+    """Set a placeholder's content. Handles text and multi-line."""
+    if not content:
+        return
+    if hasattr(ph, 'text_frame'):
+        # Check if content has newlines — if so, create multiple paragraphs
+        lines = content.split("\n")
+        if len(lines) > 1:
+            tf = ph.text_frame
+            tf.clear()
+            for i, line in enumerate(lines):
+                if i == 0:
+                    p = tf.paragraphs[0]
+                else:
+                    p = tf.add_paragraph()
+                p.text = line.strip()
+        else:
+            ph.text_frame.text = content
 
 
-# ── Title (layouts 0, 1, 2) ────────────────────────────────────────
-# PH0=title, PH13=description, PH14=date/notes
+def _populate_from_fields(phs: Dict, sd: Dict, image_path: Optional[str]):
+    """
+    Populate placeholders from structured fields as a fallback
+    (in case placeholder_map is missing or incomplete).
+    Only sets a placeholder if it wasn't already set by placeholder_map.
+    """
+    ph_map = sd.get("placeholder_map", {})
+    already_set = {int(k) for k in ph_map.keys()} if ph_map else set()
 
-def _populate_title(phs, data):
-    _set_ph(phs, 0, data.get("headline", ""))
-    _set_ph(phs, 13, data.get("subheadline", ""))
-    _set_ph(phs, 14, data.get("body", ""))  # date/notes line
+    def _try_set(idx, text):
+        if idx not in already_set and idx in phs and text:
+            _set_placeholder(phs[idx], text)
 
+    # PH0 = Title/headline
+    _try_set(0, sd.get("headline", ""))
 
-# ── Section (layouts 3, 4, 5) ──────────────────────────────────────
-# PH0=title, PH13=description
+    # PH1 = Body/subtitle
+    body = sd.get("body", "")
+    if not body and sd.get("bullets"):
+        body = "\n".join(sd["bullets"])
+    _try_set(1, body)
 
-def _populate_section(phs, data):
-    _set_ph(phs, 0, data.get("headline", ""))
-    _set_ph(phs, 13, data.get("subheadline", ""))
-
-
-# ── Quote (layouts 10, 11) ─────────────────────────────────────────
-# PH0=quote text, PH20=attribution
-
-def _populate_quote(phs, data, layout_idx):
-    quote = data.get("quote", data.get("body", ""))
-    # Add smart quotes
-    if quote and not quote.startswith("\u201C"):
-        quote = f"\u201C{quote}\u201D"
-    _set_ph(phs, 0, quote)
-    _set_ph(phs, 20, data.get("quote_attribution", ""))
-
-
-# ── Bullets (layout 12) ────────────────────────────────────────────
-# PH0=title, PH10=bullets (multi-paragraph)
-
-def _populate_bullets(phs, data):
-    _set_ph(phs, 0, data.get("headline", ""))
-    bullets = data.get("bullets", [])
-    if bullets and 10 in phs:
+    # PH10 = Secondary text / bullet area
+    bullets = sd.get("bullets", [])
+    if bullets and 10 in phs and 10 not in already_set:
         tf = phs[10].text_frame
         tf.clear()
         for i, bullet in enumerate(bullets):
-            if i == 0:
-                p = tf.paragraphs[0]
-            else:
-                p = tf.add_paragraph()
-            p.text = bullet
-            # Inherit formatting from the placeholder's default style
-    elif data.get("body") and 10 in phs:
-        phs[10].text_frame.text = data["body"]
-
-
-# ── One Column (layout 13) ─────────────────────────────────────────
-# PH0=title, PH1=body
-
-def _populate_one_column(phs, data):
-    _set_ph(phs, 0, data.get("headline", ""))
-    body = data.get("body", "")
-    if not body and data.get("bullets"):
-        body = "\n".join(data["bullets"])
-    _set_ph(phs, 1, body)
-
-
-# ── Two Column (layouts 15, 20) ────────────────────────────────────
-# PH0=title, PH1=left column, PH10=right column
-
-def _populate_two_column(phs, data):
-    _set_ph(phs, 0, data.get("headline", ""))
-    bullets = data.get("bullets", [])
-    if bullets:
-        mid = max(len(bullets) // 2, 1)
-        _set_ph(phs, 1, "\n".join(bullets[:mid]))
-        _set_ph(phs, 10, "\n".join(bullets[mid:]))
-    elif data.get("body"):
-        sentences = [s.strip() for s in data["body"].split(". ") if s.strip()]
-        mid = max(len(sentences) // 2, 1)
-        _set_ph(phs, 1, ". ".join(sentences[:mid]) + ".")
-        _set_ph(phs, 10, ". ".join(sentences[mid:]))
-
-
-# ── Text + Image (layouts 16, 17) ──────────────────────────────────
-# PH0=title, PH1=text, PH11=picture
-
-def _populate_text_image(phs, data, image_path):
-    _set_ph(phs, 0, data.get("headline", ""))
-    body = data.get("body", "")
-    if not body and data.get("bullets"):
-        body = "\n".join(data["bullets"])
-    _set_ph(phs, 1, body)
-
-    if image_path and Path(image_path).exists() and 11 in phs:
-        try:
-            phs[11].insert_picture(image_path)
-        except Exception:
-            pass
-
-
-# ── Emphasis / Blue (layout 18) ────────────────────────────────────
-# PH0=title, PH12=body
-
-def _populate_emphasis(phs, data):
-    _set_ph(phs, 0, data.get("headline", ""))
-    body = data.get("body", "")
-    if not body and data.get("bullets"):
-        body = "\n".join(f"\u2022 {b}" for b in data["bullets"])
-    _set_ph(phs, 12, body)
-
-
-# ── Icons (layouts 23, 24, 25) ──────────────────────────────────────
-# Layout 23 (1 icon): PH0=title, PH17=icon title, PH18=icon text, PH19=icon image
-# Layout 24 (2 icons): + PH20=title2, PH21=text2, PH22=image2
-# Layout 25 (3 icons): + PH23=title3, PH24=text3, PH25=image3
-#   NOTE: Layout 25 ordering is: PH23/24/25=LEFT, PH17/18/19=CENTER, PH20/21/22=RIGHT
-
-def _populate_icons(phs, data, slide_type):
-    _set_ph(phs, 0, data.get("headline", ""))
-    points = data.get("icon_points", [])
-    if not points and data.get("bullets"):
-        points = [{"label": b[:30], "description": b} for b in data["bullets"][:3]]
-
-    # icons_1 and icons_1_desc share the same placeholder structure
-    if slide_type in ("icons_1", "icons_1_desc") and len(points) >= 1:
-        _set_ph(phs, 17, points[0].get("label", ""))
-        _set_ph(phs, 18, points[0].get("description", ""))
-    elif slide_type in ("icons_2", "icons_2_desc") and len(points) >= 2:
-        _set_ph(phs, 17, points[0].get("label", ""))
-        _set_ph(phs, 18, points[0].get("description", ""))
-        _set_ph(phs, 20, points[1].get("label", ""))
-        _set_ph(phs, 21, points[1].get("description", ""))
-    elif slide_type in ("icons_3", "icons_3_desc") and len(points) >= 3:
-        # Layout 25/28: PH23/24/25=LEFT, PH17/18/19=CENTER, PH20/21/22=RIGHT
-        _set_ph(phs, 23, points[0].get("label", ""))
-        _set_ph(phs, 24, points[0].get("description", ""))
-        _set_ph(phs, 17, points[1].get("label", ""))
-        _set_ph(phs, 18, points[1].get("description", ""))
-        _set_ph(phs, 20, points[2].get("label", ""))
-        _set_ph(phs, 21, points[2].get("description", ""))
-
-
-# ── Agenda (layout 52) ─────────────────────────────────────────────
-# PH0=title, PH1=body, PH13=image
-
-def _populate_agenda(phs, data, image_path):
-    _set_ph(phs, 0, data.get("headline", ""))
-    body = data.get("body", "")
-    if not body and data.get("bullets"):
-        body = "\n".join(data["bullets"])
-    _set_ph(phs, 1, body)
-    if image_path and Path(image_path).exists() and 13 in phs:
-        try:
-            phs[13].insert_picture(image_path)
-        except Exception:
-            pass
-
-
-# ── Close (layouts 31, 32) ─────────────────────────────────────────
-
-def _populate_close(phs, data):
-    _set_ph(phs, 0, data.get("headline", "Thank You"))
-
-
-# ── Generic fallback ────────────────────────────────────────────────
-
-def _populate_generic(phs, data):
-    """Try to populate any available placeholders with whatever content we have."""
-    _set_ph(phs, 0, data.get("headline", ""))
-    _set_ph(phs, 1, data.get("body", ""))
-    if data.get("bullets") and 10 in phs:
-        tf = phs[10].text_frame
-        tf.clear()
-        for i, b in enumerate(data["bullets"]):
             p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-            p.text = b
-    _set_ph(phs, 13, data.get("subheadline", ""))
+            p.text = bullet
 
+    # PH12 = Body (blue layouts)
+    _try_set(12, sd.get("body", ""))
 
-# ── Helper ──────────────────────────────────────────────────────────
+    # PH13 = Description/subtitle
+    _try_set(13, sd.get("subheadline", ""))
 
-def _set_ph(phs: Dict[int, Any], idx: int, text: str):
-    """Set a placeholder's text if it exists and text is non-empty."""
-    if idx in phs and text:
-        phs[idx].text_frame.text = text
+    # PH14 = Date/notes
+    _try_set(14, sd.get("date_line", ""))
+
+    # PH20 = Quote attribution
+    _try_set(20, sd.get("quote_attribution", ""))
+
+    # Icons: PH17/18, PH20/21, PH23/24
+    points = sd.get("icon_points", [])
+    if points:
+        if len(points) >= 1:
+            _try_set(17, points[0].get("label", ""))
+            _try_set(18, points[0].get("description", ""))
+        if len(points) >= 2:
+            _try_set(20, points[1].get("label", ""))
+            _try_set(21, points[1].get("description", ""))
+        if len(points) >= 3:
+            _try_set(23, points[2].get("label", ""))
+            _try_set(24, points[2].get("description", ""))
+
+    # Image placeholders
+    if image_path and Path(image_path).exists():
+        for img_idx in (11, 10, 15, 13, 19, 22, 25):
+            if img_idx in phs and img_idx not in already_set:
+                try:
+                    phs[img_idx].insert_picture(image_path)
+                    break
+                except Exception:
+                    continue

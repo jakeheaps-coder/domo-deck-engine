@@ -1,37 +1,65 @@
 """
-Content writer — resolves slide content from multiple sources.
+Content writer — resolves slide content from multiple sources AND picks
+the best layout from the full 309-layout catalog for each slide.
 
-Priority order per slide:
-1. User-provided explicit content (per_slide) → use verbatim
-2. User talking points + outline → Gemini structures into slides
-3. KG research (if auto_research=true) → enriches with data
-4. Gemini generation → fills remaining gaps
+The AI sees the entire layout catalog and chooses layouts that:
+1. Match the content (bullets → bullet layout, quote → quote layout, etc.)
+2. Create visual variety (don't repeat the same layout)
+3. Stay coherent (consistent color family based on audience)
 """
 
+from pathlib import Path
 from typing import Dict, Any, List
 from helpers.gemini_helper import generate_structured
 from models.deck_config import ContentInput
 
+CATALOG_PATH = Path(__file__).parent.parent / "templates" / "layout_catalog.txt"
 
-SYSTEM_PROMPT = """You are an expert presentation content writer for Domo, a data and AI platform company.
+SYSTEM_PROMPT = """You are an expert presentation designer and content writer for Domo.
 
-BRAND VOICE:
-- Confident but not arrogant. Data-backed. Forward-looking.
-- Speak to outcomes, not features.
-- Use active voice. Short sentences. One idea per slide.
+You have access to a PowerPoint template with 309 slide layouts. For each slide,
+you must pick the BEST layout_index from the catalog AND write the content.
 
-SLIDE CONTENT RULES:
-- Headlines: 5-8 words max. Active voice. No ending punctuation.
+CONTENT RULES:
+- Headlines: 5-8 words max. Active voice. Declarative statements, NOT imperatives.
+  GOOD: "Retention Hit Record 94.2%" BAD: "Achieve Record Retention Rates"
 - Bullets: 3-5 per slide. Each 8-12 words. Start with action verbs.
 - Body text: 2-3 sentences max.
 - Speaker notes: 2-4 sentences of what to SAY.
 - Quote slides: Attribution as "– Name, Title"
 - Icon slides: 3-5 word label + 1 sentence description per point.
 
-OUTPUT: Return a JSON array of slide objects. Each must have:
+LAYOUT SELECTION RULES:
+- Use layouts 0-2 for title slides (0=blue, 1=white, 2=gradient)
+- Use layouts 3-5 for section breaks (3=blue, 4=white, 5=gradient)
+- Use layouts 10-11 for quotes (10=blue, 11=white)
+- Use layouts 12-22 for content slides (bullets, columns, images, blue variants)
+- Use layouts 23-30 for icon slides and mockups
+- Use layouts 31-32 for closing slides
+- Layouts 33+ are specialty (timelines, image galleries, dashboards, testimonials, etc.)
+  Use these for visual variety when the content calls for it.
+- NEVER repeat the same layout_index in consecutive slides.
+- Pick a consistent color family for the deck (blue OR white OR gradient for structural slides).
+- Mix content layouts for variety (don't use layout 12 for every content slide).
+
+PLACEHOLDER RULES — each layout has specific placeholders. You must provide content
+that matches the placeholders available in that layout:
+- PH0 = Title/headline (almost all layouts have this)
+- PH1 = Body text or subtitle
+- PH10 = Secondary text or bullet area
+- PH11-PH15 = Picture placeholders (provide image_prompt if needed)
+- PH12 = Body text (blue layouts)
+- PH13 = Description/subtitle
+- PH14 = Date/notes line
+- PH17/18 = Icon title/description (1st icon)
+- PH20/21 = Icon title/description (2nd icon)
+- PH23/24 = Icon title/description (3rd icon, LEFT position in layout 25)
+
+OUTPUT FORMAT — JSON array of slide objects:
 {
   "position": <int>,
-  "slide_type": "<string>",
+  "layout_index": <int 0-308>,
+  "layout_name": "<name from catalog>",
   "headline": "<string>",
   "subheadline": "<string or null>",
   "body": "<string or null>",
@@ -40,81 +68,43 @@ OUTPUT: Return a JSON array of slide objects. Each must have:
   "quote": "<string or null>",
   "quote_attribution": "<string or null>",
   "speaker_notes": "<string>",
-  "image_prompt": "<string or null>"
+  "image_prompt": "<string or null>",
+  "placeholder_map": {"<PH_index>": "<content>"}
 }
+
+The placeholder_map is the PRIMARY way content gets into the slide.
+Map placeholder indices (as strings) to content values.
 """
 
 
+def _load_catalog() -> str:
+    if CATALOG_PATH.exists():
+        return CATALOG_PATH.read_text()
+    return ""
+
+
 def resolve_content(
-    slide_sequence: List[str],
     content: ContentInput,
     deck_title: str,
     audience: str,
     tone: str,
     purpose: str,
     key_messages: List[str],
+    slide_count: str = "10-15",
     research_summary: str = "",
     additional_context: str = "",
+    design_preference: str = "blue",
 ) -> List[Dict[str, Any]]:
     """
-    Resolve content for all slides, merging user input with AI generation.
+    Resolve content for all slides. Gemini picks layouts from the full catalog.
     """
-    # Build user content map by position
+    # User explicit slides
     user_map: Dict[int, Dict] = {}
     for sc in content.per_slide:
         user_map[sc.position] = sc.model_dump(exclude_none=True)
 
-    # Check which slides need AI
-    needs_ai = [i for i in range(len(slide_sequence)) if i not in user_map]
-
-    # If user provided everything AND no outline/talking points, skip AI
-    has_user_text = bool(content.outline or content.talking_points or content.source_text)
-    if not needs_ai and not has_user_text:
-        return _from_user_only(slide_sequence, user_map)
-
-    # Generate AI content for missing slides
-    ai_slides = _generate_ai(
-        slide_sequence, needs_ai, content, deck_title,
-        audience, tone, purpose, key_messages,
-        research_summary, additional_context,
-    )
-    ai_by_pos = {s.get("position", i): s for i, s in enumerate(ai_slides)}
-
-    # Merge: user content wins
-    final = []
-    for i, stype in enumerate(slide_sequence):
-        if i in user_map:
-            slide = user_map[i]
-            slide["position"] = i
-            slide["slide_type"] = stype
-            final.append(slide)
-        elif i in ai_by_pos:
-            slide = ai_by_pos[i]
-            slide["slide_type"] = stype
-            final.append(slide)
-        else:
-            final.append({"position": i, "slide_type": stype, "headline": ""})
-    return final
-
-
-def _from_user_only(seq, user_map):
-    slides = []
-    for i, stype in enumerate(seq):
-        if i in user_map:
-            s = user_map[i]
-            s["position"] = i
-            s["slide_type"] = stype
-            slides.append(s)
-        else:
-            slides.append({"position": i, "slide_type": stype, "headline": ""})
-    return slides
-
-
-def _generate_ai(seq, needs_ai, content, title, audience, tone, purpose, msgs, research, ctx):
-    descs = []
-    for i, stype in enumerate(seq):
-        tag = " [USER PROVIDED]" if i not in needs_ai else ""
-        descs.append(f"Slide {i+1}: type={stype}{tag}")
+    catalog = _load_catalog()
+    target = {"5-8": 7, "10-15": 12, "15-20": 17, "20+": 22}.get(slide_count, 12)
 
     user_block = ""
     if content.outline:
@@ -124,47 +114,70 @@ def _generate_ai(seq, needs_ai, content, title, audience, tone, purpose, msgs, r
     if content.source_text:
         user_block += f"\nUSER SOURCE TEXT:\n{content.source_text[:3000]}\n"
 
-    msgs_block = "\n".join(f"- {m}" for m in msgs if m) if msgs else "- Not specified"
+    user_slides_block = ""
+    if user_map:
+        user_slides_block = "\nUSER-PROVIDED SLIDE CONTENT (use verbatim, pick appropriate layout):\n"
+        for pos, sc in sorted(user_map.items()):
+            user_slides_block += f"  Slide {pos}: {sc}\n"
 
-    prompt = f"""Generate content for a {len(seq)}-slide presentation.
+    msgs = "\n".join(f"- {m}" for m in key_messages if m) if key_messages else "- Not specified"
 
-DECK TITLE: {title}
+    prompt = f"""Design a {target}-slide presentation and pick the best layout for each slide.
+
+DECK TITLE: {deck_title}
 AUDIENCE: {audience}
 TONE: {tone}
 PURPOSE: {purpose}
+COLOR PREFERENCE: {design_preference} (use this color family for title/section/close slides)
 
 KEY MESSAGES:
-{msgs_block}
+{msgs}
+{user_block}{user_slides_block}
+{"RESEARCH DATA (use to enrich content):" + chr(10) + research_summary if research_summary else ""}
+ADDITIONAL CONTEXT: {additional_context}
 
-SLIDE SEQUENCE:
-{chr(10).join(descs)}
-{user_block}
-{"RESEARCH DATA (enrich, don't override user content):" + chr(10) + research if research else ""}
-ADDITIONAL CONTEXT: {ctx}
+LAYOUT CATALOG (index|name|placeholders):
+{catalog}
 
-Generate content ONLY for slides NOT marked [USER PROVIDED].
+Generate exactly {target} slides. For each slide, pick the best layout_index from the catalog above.
+Create visual variety — use different layout types, don't repeat layouts consecutively.
+Include a placeholder_map that maps placeholder indices to content for that layout.
 Return a JSON array of slide objects."""
 
     result = generate_structured(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.6)
 
     if "error" in result:
-        return _fallback(seq, title, purpose)
+        return _fallback(target, deck_title, purpose)
     if isinstance(result, list):
-        return result
-    if isinstance(result, dict) and "slides" in result:
-        return result["slides"]
-    return _fallback(seq, title, purpose)
+        slides = result
+    elif isinstance(result, dict) and "slides" in result:
+        slides = result["slides"]
+    else:
+        return _fallback(target, deck_title, purpose)
+
+    # Merge user content (user wins)
+    for i, slide in enumerate(slides):
+        slide["position"] = i
+        if i in user_map:
+            for k, v in user_map[i].items():
+                if v is not None:
+                    slide[k] = v
+
+    return slides
 
 
-def _fallback(seq, title, purpose):
+def _fallback(count, title, purpose):
+    layouts = [0, 3, 12, 15, 12, 18, 3, 12, 25, 12, 3, 31]
+    while len(layouts) < count:
+        layouts.insert(-1, 12)
     return [
         {
             "position": i,
-            "slide_type": stype,
+            "layout_index": layouts[i] if i < len(layouts) else 12,
             "headline": title if i == 0 else f"Section {i}",
             "subheadline": purpose if i == 0 else None,
-            "bullets": ["Point 1", "Point 2", "Point 3"] if stype == "bullets" else None,
-            "speaker_notes": f"[Slide {i+1}: {stype}]",
+            "bullets": ["Point 1", "Point 2", "Point 3"] if layouts[i] == 12 else None,
+            "placeholder_map": {},
         }
-        for i, stype in enumerate(seq)
+        for i in range(count)
     ]
