@@ -1,1 +1,1 @@
-from models.deck_config import DeckConfig, SlideConfig, ThemeConfig, DataQuery
+from models.deck_config import DeckConfig, ContentInput, SlideContent, ThemeConfig, DataQuery

@@ -1,42 +1,42 @@
 """
-Content writer — uses Gemini to generate slide content based on research
-and deck configuration.
+Content writer — resolves slide content from multiple sources.
+
+Priority order per slide:
+1. User-provided explicit content (per_slide) → use verbatim
+2. User talking points + outline → Gemini structures into slides
+3. KG research (if auto_research=true) → enriches with data
+4. Gemini generation → fills remaining gaps
 """
 
-import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from helpers.gemini_helper import generate_structured
-from models.deck_config import LAYOUTS
+from models.deck_config import ContentInput
 
 
 SYSTEM_PROMPT = """You are an expert presentation content writer for Domo, a data and AI platform company.
 
 BRAND VOICE:
 - Confident but not arrogant. Data-backed. Forward-looking.
-- Speak to outcomes, not features. "See your data in action" not "We have dashboards."
+- Speak to outcomes, not features.
 - Use active voice. Short sentences. One idea per slide.
-- Executive audiences: lead with metrics, be concise, skip jargon.
-- Team audiences: be more narrative, celebrate wins, include context.
 
 SLIDE CONTENT RULES:
-- Headlines: 5-8 words max. Active voice. No punctuation.
-- Subheadlines: 1 sentence max. Provides context for the headline.
-- Bullets: 3-5 per slide. Each bullet is 1 line (8-12 words). Start with action verbs.
-- Body text: 2-3 sentences max. Tell a mini-story or provide evidence.
-- Speaker notes: 2-4 sentences. What the presenter should SAY (not read from the slide).
-- Quote slides: Attribution format is "— Name, Title"
-- Icon slides: Each icon point gets a 3-5 word label + 1 sentence description.
+- Headlines: 5-8 words max. Active voice. No ending punctuation.
+- Bullets: 3-5 per slide. Each 8-12 words. Start with action verbs.
+- Body text: 2-3 sentences max.
+- Speaker notes: 2-4 sentences of what to SAY.
+- Quote slides: Attribution as "– Name, Title"
+- Icon slides: 3-5 word label + 1 sentence description per point.
 
-OUTPUT FORMAT:
-Return a JSON array of slide objects. Each slide must have:
+OUTPUT: Return a JSON array of slide objects. Each must have:
 {
   "position": <int>,
-  "layout_id": <int>,
+  "slide_type": "<string>",
   "headline": "<string>",
   "subheadline": "<string or null>",
   "body": "<string or null>",
   "bullets": ["<string>", ...] or null,
-  "icon_points": [{"label": "<string>", "description": "<string>"}] or null,
+  "icon_points": [{"label": "<str>", "description": "<str>"}] or null,
   "quote": "<string or null>",
   "quote_attribution": "<string or null>",
   "speaker_notes": "<string>",
@@ -45,116 +45,126 @@ Return a JSON array of slide objects. Each slide must have:
 """
 
 
-def generate_slide_content(
+def resolve_content(
+    slide_sequence: List[str],
+    content: ContentInput,
     deck_title: str,
     audience: str,
     tone: str,
     purpose: str,
     key_messages: List[str],
-    layout_sequence: List[int],
-    research_summary: str,
+    research_summary: str = "",
     additional_context: str = "",
-    template_notes: str = "",
 ) -> List[Dict[str, Any]]:
     """
-    Generate content for all slides in the deck.
-
-    Args:
-        deck_title: The presentation title
-        audience: Target audience
-        tone: Tone/style to use
-        purpose: What the deck is about
-        key_messages: Key points to hit
-        layout_sequence: Ordered list of layout IDs
-        research_summary: Text summary from the researcher
-        additional_context: Any extra instructions
-
-    Returns:
-        List of slide content dicts, one per slide
+    Resolve content for all slides, merging user input with AI generation.
     """
-    # Build the layout description for each slide
-    slide_descriptions = []
-    for i, layout_id in enumerate(layout_sequence):
-        layout = LAYOUTS.get(layout_id, {"label": "Unknown", "type": "bullets"})
-        slide_descriptions.append(f"Slide {i+1}: Layout {layout_id} ({layout['label']}) — {layout['type']} slide. Use: {layout.get('use', '')}")
+    # Build user content map by position
+    user_map: Dict[int, Dict] = {}
+    for sc in content.per_slide:
+        user_map[sc.position] = sc.model_dump(exclude_none=True)
 
-    slides_block = "\n".join(slide_descriptions)
-    messages_block = "\n".join(f"- {m}" for m in key_messages if m) if key_messages else "- Not specified"
+    # Check which slides need AI
+    needs_ai = [i for i in range(len(slide_sequence)) if i not in user_map]
 
-    prompt = f"""Generate content for a {len(layout_sequence)}-slide presentation.
+    # If user provided everything AND no outline/talking points, skip AI
+    has_user_text = bool(content.outline or content.talking_points or content.source_text)
+    if not needs_ai and not has_user_text:
+        return _from_user_only(slide_sequence, user_map)
 
-DECK TITLE: {deck_title}
+    # Generate AI content for missing slides
+    ai_slides = _generate_ai(
+        slide_sequence, needs_ai, content, deck_title,
+        audience, tone, purpose, key_messages,
+        research_summary, additional_context,
+    )
+    ai_by_pos = {s.get("position", i): s for i, s in enumerate(ai_slides)}
+
+    # Merge: user content wins
+    final = []
+    for i, stype in enumerate(slide_sequence):
+        if i in user_map:
+            slide = user_map[i]
+            slide["position"] = i
+            slide["slide_type"] = stype
+            final.append(slide)
+        elif i in ai_by_pos:
+            slide = ai_by_pos[i]
+            slide["slide_type"] = stype
+            final.append(slide)
+        else:
+            final.append({"position": i, "slide_type": stype, "headline": ""})
+    return final
+
+
+def _from_user_only(seq, user_map):
+    slides = []
+    for i, stype in enumerate(seq):
+        if i in user_map:
+            s = user_map[i]
+            s["position"] = i
+            s["slide_type"] = stype
+            slides.append(s)
+        else:
+            slides.append({"position": i, "slide_type": stype, "headline": ""})
+    return slides
+
+
+def _generate_ai(seq, needs_ai, content, title, audience, tone, purpose, msgs, research, ctx):
+    descs = []
+    for i, stype in enumerate(seq):
+        tag = " [USER PROVIDED]" if i not in needs_ai else ""
+        descs.append(f"Slide {i+1}: type={stype}{tag}")
+
+    user_block = ""
+    if content.outline:
+        user_block += f"\nUSER OUTLINE:\n{content.outline}\n"
+    if content.talking_points:
+        user_block += "\nUSER TALKING POINTS:\n" + "\n".join(f"- {t}" for t in content.talking_points) + "\n"
+    if content.source_text:
+        user_block += f"\nUSER SOURCE TEXT:\n{content.source_text[:3000]}\n"
+
+    msgs_block = "\n".join(f"- {m}" for m in msgs if m) if msgs else "- Not specified"
+
+    prompt = f"""Generate content for a {len(seq)}-slide presentation.
+
+DECK TITLE: {title}
 AUDIENCE: {audience}
 TONE: {tone}
 PURPOSE: {purpose}
 
-KEY MESSAGES TO INCORPORATE:
-{messages_block}
+KEY MESSAGES:
+{msgs_block}
 
 SLIDE SEQUENCE:
-{slides_block}
+{chr(10).join(descs)}
+{user_block}
+{"RESEARCH DATA (enrich, don't override user content):" + chr(10) + research if research else ""}
+ADDITIONAL CONTEXT: {ctx}
 
-RESEARCH DATA (use this to inform content — do not copy verbatim):
-{research_summary}
-
-TEMPLATE NOTES: {template_notes}
-ADDITIONAL CONTEXT: {additional_context}
-
-Generate compelling, specific content for each slide. Use the research data to add real product names, features, metrics, and competitive points. Make every headline punchy and every bullet actionable. Return the JSON array of slide objects."""
+Generate content ONLY for slides NOT marked [USER PROVIDED].
+Return a JSON array of slide objects."""
 
     result = generate_structured(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.6)
 
     if "error" in result:
-        # Return fallback content
-        return _generate_fallback(layout_sequence, deck_title, purpose)
-
-    # Handle both direct array and wrapped responses
+        return _fallback(seq, title, purpose)
     if isinstance(result, list):
-        slides = result
-    elif isinstance(result, dict) and "slides" in result:
-        slides = result["slides"]
-    else:
-        return _generate_fallback(layout_sequence, deck_title, purpose)
-
-    return slides
+        return result
+    if isinstance(result, dict) and "slides" in result:
+        return result["slides"]
+    return _fallback(seq, title, purpose)
 
 
-def rewrite_slide(
-    slide_content: Dict[str, Any],
-    instruction: str,
-    tone: str = "Executive",
-) -> Dict[str, Any]:
-    """Rewrite a single slide's content with specific instructions."""
-    prompt = f"""Rewrite this slide content following the instruction below.
-
-CURRENT CONTENT:
-{json.dumps(slide_content, indent=2)}
-
-INSTRUCTION: {instruction}
-TONE: {tone}
-
-Return the updated slide as a single JSON object with the same fields."""
-
-    result = generate_structured(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.5)
-    if "error" in result:
-        return slide_content  # Return original on failure
-    return result
-
-
-def _generate_fallback(layout_sequence: List[int], title: str, purpose: str) -> List[Dict[str, Any]]:
-    """Generate basic placeholder content if Gemini fails."""
-    slides = []
-    for i, layout_id in enumerate(layout_sequence):
-        layout = LAYOUTS.get(layout_id, {"label": "Bullets", "type": "bullets"})
-        slide = {
+def _fallback(seq, title, purpose):
+    return [
+        {
             "position": i,
-            "layout_id": layout_id,
+            "slide_type": stype,
             "headline": title if i == 0 else f"Section {i}",
             "subheadline": purpose if i == 0 else None,
-            "body": None,
-            "bullets": ["Point 1", "Point 2", "Point 3"] if layout["type"] == "bullets" else None,
-            "speaker_notes": f"[Slide {i+1}: {layout['label']}]",
-            "image_prompt": None,
+            "bullets": ["Point 1", "Point 2", "Point 3"] if stype == "bullets" else None,
+            "speaker_notes": f"[Slide {i+1}: {stype}]",
         }
-        slides.append(slide)
-    return slides
+        for i, stype in enumerate(seq)
+    ]

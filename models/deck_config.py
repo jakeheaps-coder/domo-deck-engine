@@ -5,98 +5,151 @@ from pydantic import BaseModel, Field
 
 
 class DataQuery(BaseModel):
-    """A query against a Domo dataset for data-driven slides."""
     dataset_id: str
-    query: str  # SQL or metric name
+    query: str
 
 
 class ThemeConfig(BaseModel):
-    """Theme overrides within brand guidelines."""
     primary_color: str = "#99CCEE"
     accent_color: str = "#FF9922"
-    background_style: str = "white"  # white | blue | gradient | dark
-    font_family: str = "Open Sans"  # enforced — always Open Sans
+    font_family: str = "Open Sans"
 
 
-class ManualContent(BaseModel):
+class SlideContent(BaseModel):
     """User-provided content for a specific slide."""
+    position: int
     headline: Optional[str] = None
     subheadline: Optional[str] = None
     body: Optional[str] = None
     bullets: Optional[list[str]] = None
     speaker_notes: Optional[str] = None
+    quote: Optional[str] = None
+    quote_attribution: Optional[str] = None
+    icon_points: Optional[list[dict]] = None  # [{"label": ..., "description": ...}]
 
 
-class SlideConfig(BaseModel):
-    """Configuration for a single slide."""
-    position: int
-    layout_id: int  # Maps to LAYOUTS from the deck builder
-    layout_type: str = "bullets"  # title | section | bullets | two_column | quote | icons | image | close
-    content_source: str = "auto"  # auto | manual | asset
-    manual_content: Optional[ManualContent] = None
-    asset_ids: Optional[list[str]] = None
-    media_prompt: Optional[str] = None  # Custom prompt for AI image generation
-    data_source: Optional[DataQuery] = None
+class ContentInput(BaseModel):
+    """All the ways a user can provide content. All fields optional."""
+    outline: Optional[str] = None              # "Slide 1: intro. Slide 2: Q1 results..."
+    talking_points: list[str] = Field(default_factory=list)  # ["Retention hit 94%", ...]
+    source_text: Optional[str] = None          # Paste from a doc — AI structures it
+    per_slide: list[SlideContent] = Field(default_factory=list)  # Explicit per-slide content
 
 
-# Slide layout definitions (ported from deck builder JSX)
-LAYOUTS = {
-    0:  {"label": "Title — Blue",       "type": "title",      "use": "Board/Executive opener"},
-    1:  {"label": "Title — White",      "type": "title",      "use": "Sales/Customer opener"},
-    2:  {"label": "Title — Gradient",   "type": "title",      "use": "Internal/Strategy opener"},
-    3:  {"label": "Section — Blue",     "type": "section",    "use": "Chapter break (executive)"},
-    4:  {"label": "Section — White",    "type": "section",    "use": "Chapter break (sales)"},
-    5:  {"label": "Section — Gradient", "type": "section",    "use": "Chapter break (strategy)"},
-    10: {"label": "Quote — Blue",       "type": "quote",      "use": "Key statement, exec emphasis"},
-    11: {"label": "Quote — White",      "type": "quote",      "use": "Testimonial, customer voice"},
-    12: {"label": "Bullets",            "type": "bullets",    "use": "Main workhorse — 4-5 bullets"},
-    13: {"label": "1-Column",           "type": "one_column", "use": "Single narrative paragraph"},
-    14: {"label": "2-Column",           "type": "two_column", "use": "Side-by-side comparison"},
-    16: {"label": "Text + Image",       "type": "text_image", "use": "Content with supporting visual"},
-    17: {"label": "Large Photo",        "type": "image",      "use": "Visual-led with caption"},
-    22: {"label": "Bullets — Blue",     "type": "bullets",    "use": "Strategic emphasis slide"},
-    23: {"label": "2-Col Blue",         "type": "two_column", "use": "Two-column blue emphasis"},
-    27: {"label": "1 Icon",             "type": "icons",      "use": "Single feature / value prop"},
-    28: {"label": "2 Icons",            "type": "icons",      "use": "Two pillars / features"},
-    29: {"label": "3 Icons",            "type": "icons",      "use": "Three steps / value props"},
-    35: {"label": "Close — Blue",       "type": "close",      "use": "Thank you / closing"},
-    36: {"label": "Close — White",      "type": "close",      "use": "Thank you / closing (light)"},
+# ── Design Styles ───────────────────────────────────────────────────
+# Maps slide types → template layout indices for visual coherence
+
+DESIGN_STYLES = {
+    "executive_blue": {
+        "description": "Blue backgrounds, white text. Formal, board-level.",
+        "title": 0,           # Title slide - blue
+        "section": 3,          # Section title - blue
+        "bullets": 12,         # Content - basic - bullets
+        "one_column": 13,      # Content - basic - 1 column
+        "two_column": 15,      # Content - 2 column
+        "text_image": 16,      # Content - text - picture
+        "large_image": 17,     # Content - large photo - text
+        "quote": 10,           # Quote - blue
+        "emphasis": 18,        # Content - basic - blue
+        "emphasis_2col": 20,   # Content - 2 column - blue
+        "icons_1": 23,         # 1 icon - black
+        "icons_2": 24,         # 2 icons - black
+        "icons_3": 25,         # 3 icons - black
+        "icons_1_desc": 26,    # 1 icon with description
+        "icons_2_desc": 27,    # 2 icons with description
+        "icons_3_desc": 28,    # 3 icons with description
+        "phone_mockup": 29,    # Text + phone mockup
+        "screen_mockup": 30,   # Text + screen mockup
+        "paragraph": 53,       # Basic paragraph slide
+        "intro_image": 54,     # Introduction with image
+        "agenda": 52,          # Agenda with image
+        "text_landscape": 250, # Text with landscape image
+        "close": 31,           # Thank you - blue
+    },
+    "clean_white": {
+        "description": "White backgrounds, dark text. Modern, customer-facing.",
+        "title": 1,            # Title Slide - white
+        "section": 4,          # Section title - white
+        "bullets": 12,
+        "one_column": 13,
+        "two_column": 15,
+        "text_image": 16,
+        "large_image": 17,
+        "quote": 11,           # Quote - white
+        "emphasis": 13,
+        "emphasis_2col": 15,
+        "icons_1": 23,
+        "icons_2": 24,
+        "icons_3": 25,
+        "icons_1_desc": 26,
+        "icons_2_desc": 27,
+        "icons_3_desc": 28,
+        "phone_mockup": 29,
+        "screen_mockup": 30,
+        "paragraph": 53,
+        "intro_image": 54,
+        "agenda": 52,
+        "text_landscape": 250,
+        "close": 32,           # Thank you - white
+    },
+    "gradient": {
+        "description": "Gradient accents. Strategic, vision-forward.",
+        "title": 2,            # Title Slide - blue gradient
+        "section": 5,          # Section title - blue gradient
+        "bullets": 12,
+        "one_column": 13,
+        "two_column": 15,
+        "text_image": 16,
+        "large_image": 17,
+        "quote": 10,
+        "emphasis": 18,
+        "emphasis_2col": 20,
+        "icons_1": 23,
+        "icons_2": 24,
+        "icons_3": 25,
+        "icons_1_desc": 26,
+        "icons_2_desc": 27,
+        "icons_3_desc": 28,
+        "phone_mockup": 29,
+        "screen_mockup": 30,
+        "paragraph": 53,
+        "intro_image": 54,
+        "agenda": 52,
+        "text_landscape": 250,
+        "close": 31,
+    },
 }
 
-# Template presets
-TEMPLATE_PRESETS = {
-    "Board / Executive": {
-        "file": "domo_board_template.pptx",
-        "default_layouts": [0, 3, 12, 14, 3, 12, 12, 12, 12, 3, 12, 35],
-        "tone_default": "Executive — concise, data-forward",
-        "audience_default": "Board",
-        "slide_suggestion": "10-15",
-        "notes": "Match CS Board template exactly. Light sidebar bar, blue accent headers (ALL CAPS), Domo logo top-left, CONFIDENTIAL footer, page numbers. One idea per slide.",
-    },
-    "Internal / Strategy": {
-        "file": "domo_default_template.pptx",
-        "default_layouts": [2, 5, 12, 12, 28, 14, 12, 12, 3, 12, 35],
-        "tone_default": "Strategic — vision + rationale",
-        "audience_default": "Executive",
-        "slide_suggestion": "10-15",
-        "notes": "Use gradient section breaks. 2-column layouts for compare/contrast. Icon slides for pillars.",
-    },
-    "QBR / Business Review": {
-        "file": "domo_default_template.pptx",
-        "default_layouts": [0, 3, 12, 14, 12, 22, 3, 12, 12, 23, 12, 35],
-        "tone_default": "Analytical — evidence-heavy",
-        "audience_default": "Executive",
-        "slide_suggestion": "15-20",
-        "notes": "Lead with scorecard. Use 2-col for period-over-period. Blue emphasis for risks/wins.",
-    },
-    "CS All Hands": {
-        "file": "domo_default_template.pptx",
-        "default_layouts": [1, 4, 12, 29, 12, 10, 12, 3, 12, 28, 12, 36],
-        "tone_default": "Narrative — story-driven",
-        "audience_default": "CS Team",
-        "slide_suggestion": "15-20",
-        "notes": "Use icon slides for initiatives. Quotes for recognition moments. White close for warmth.",
-    },
+# Template → design style auto-mapping
+TEMPLATE_STYLE_MAP = {
+    "Board / Executive": "executive_blue",
+    "Internal / Strategy": "gradient",
+    "QBR / Business Review": "executive_blue",
+    "CS All Hands": "clean_white",
+}
+
+# Default slide type sequences per template — designed for visual variety
+TEMPLATE_SEQUENCES = {
+    "Board / Executive": [
+        "title", "section", "bullets", "two_column", "emphasis",
+        "section", "icons_3", "bullets", "text_image",
+        "section", "bullets", "close"
+    ],
+    "Internal / Strategy": [
+        "title", "section", "paragraph", "icons_3_desc",
+        "two_column", "section", "text_image", "bullets",
+        "emphasis", "section", "icons_2", "close"
+    ],
+    "QBR / Business Review": [
+        "title", "section", "bullets", "two_column",
+        "emphasis", "icons_2", "section", "text_image",
+        "bullets", "emphasis_2col", "section", "close"
+    ],
+    "CS All Hands": [
+        "title", "section", "bullets", "icons_3",
+        "paragraph", "quote", "section", "text_image",
+        "icons_2_desc", "bullets", "section", "close"
+    ],
 }
 
 
@@ -112,12 +165,11 @@ class DeckConfig(BaseModel):
     industry: Optional[str] = None
     key_messages: list[str] = Field(default_factory=list)
     slide_count: str = "10-15"
-    slides: Optional[list[SlideConfig]] = None  # None = auto-generate from template
+    design_style: Optional[str] = None  # Override: "executive_blue" | "clean_white" | "gradient"
+    slide_sequence: Optional[list[str]] = None  # Override: ["title", "section", "bullets", ...]
+    content: ContentInput = Field(default_factory=ContentInput)
     theme: ThemeConfig = Field(default_factory=ThemeConfig)
-    uploaded_files: list[str] = Field(default_factory=list)
-    asset_ids: list[str] = Field(default_factory=list)
-    fileset_ids: list[str] = Field(default_factory=list)
-    dataset_queries: list[DataQuery] = Field(default_factory=list)
     additional_context: str = ""
     auto_research: bool = True
-    auto_media: bool = True
+    auto_media: bool = False  # Default off — user must opt in
+    enable_critique: bool = True

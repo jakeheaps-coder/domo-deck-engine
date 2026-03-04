@@ -1,422 +1,297 @@
 """
-Slide builder — assembles .pptx files using python-pptx.
-Builds branded Domo presentations from structured slide content.
+Slide builder — loads the real DOMO_BRAND FORMAT TEMPLATE and populates
+its native placeholders. All design (fonts, colors, backgrounds, logos,
+shapes) comes from the template — we only inject content.
 """
 
-import copy
 import io
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 from pptx import Presentation
-from pptx.util import Inches, Pt, Emu
-from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN
+from pptx.util import Inches
+from pptx.oxml.ns import qn
 
-from config import BRAND, SLIDE_WIDTH_INCHES, SLIDE_HEIGHT_INCHES, ASSETS_DIR
-from models.deck_config import LAYOUTS
+from config import TEMPLATES_DIR
+from models.deck_config import DESIGN_STYLES, TEMPLATE_STYLE_MAP
 
-
-# Brand colors as RGBColor objects
-DOMO_BLUE = RGBColor(0x99, 0xCC, 0xEE)
-DOMO_ORANGE = RGBColor(0xFF, 0x99, 0x22)
-DARK_TEXT = RGBColor(0x3F, 0x45, 0x4D)
-LIGHT_BG = RGBColor(0xF1, 0xF6, 0xFA)
-WHITE = RGBColor(0xFF, 0xFF, 0xFF)
-GRAY = RGBColor(0x88, 0x88, 0x88)
-BORDER = RGBColor(0xDC, 0xE4, 0xEA)
-FONT_NAME = "Open Sans"
-
-# Slide dimensions
-SW = Inches(SLIDE_WIDTH_INCHES)
-SH = Inches(SLIDE_HEIGHT_INCHES)
+TEMPLATE_PATH = TEMPLATES_DIR / "domo_brand_template.pptx"
 
 
 def build_presentation(
     slides: List[Dict[str, Any]],
-    title: str = "Untitled",
+    design_style: str = "executive_blue",
     image_map: Optional[Dict[int, str]] = None,
-    background_style: str = "white",
+    title: str = "Untitled",
 ) -> bytes:
     """
-    Build a complete .pptx from slide content.
+    Build a .pptx by loading the real Domo template and populating placeholders.
 
     Args:
-        slides: List of slide content dicts from content_writer
+        slides: List of slide content dicts
+        design_style: "executive_blue" | "clean_white" | "gradient"
+        image_map: {slide_position: image_path}
         title: Deck title (for metadata)
-        image_map: Dict of {slide_position: image_path}
-        background_style: "white" | "blue" | "gradient" | "dark"
 
     Returns:
         .pptx file as bytes
     """
     image_map = image_map or {}
+    style = DESIGN_STYLES.get(design_style, DESIGN_STYLES["executive_blue"])
 
-    prs = Presentation()
-    prs.slide_width = SW
-    prs.slide_height = SH
+    # Load the template (preserves all masters, themes, fonts, colors)
+    prs = Presentation(str(TEMPLATE_PATH))
 
-    for slide_data in slides:
-        layout_id = slide_data.get("layout_id", 12)
-        layout_info = LAYOUTS.get(layout_id, {"type": "bullets"})
-        layout_type = layout_info["type"]
-        position = slide_data.get("position", 0)
-        image_path = image_map.get(position)
+    # Clear all 1085 example slides — keep only layouts
+    _clear_slides(prs)
 
-        # Determine background based on layout
-        is_blue = layout_id in (0, 3, 10, 22, 23, 35)
-        is_gradient = layout_id in (2, 5)
+    # Build each slide using the correct layout
+    for sd in slides:
+        slide_type = sd.get("slide_type", "bullets")
+        position = sd.get("position", 0)
+        img = image_map.get(position)
 
-        slide = prs.slides.add_slide(prs.slide_layouts[6])  # Blank layout
+        # Resolve the layout index from the design style
+        layout_idx = style.get(slide_type, style.get("bullets", 12))
+        layout = prs.slide_layouts[layout_idx]
+        slide = prs.slides.add_slide(layout)
 
-        # Set background
-        if is_blue:
-            _set_solid_bg(slide, DOMO_BLUE)
-        elif is_gradient:
-            _set_solid_bg(slide, RGBColor(0x5B, 0x89, 0xB3))
-        # White layouts keep default white
+        # Populate based on slide type
+        _populate_slide(slide, sd, slide_type, layout_idx, img)
 
-        # Text colors based on background
-        title_color = WHITE if (is_blue or is_gradient) else DARK_TEXT
-        body_color = WHITE if (is_blue or is_gradient) else DARK_TEXT
-        accent_color = DOMO_ORANGE if (is_blue or is_gradient) else DOMO_BLUE
-
-        # Build slide based on type
-        if layout_type == "title":
-            _build_title_slide(slide, slide_data, title_color, accent_color)
-        elif layout_type == "section":
-            _build_section_slide(slide, slide_data, title_color, accent_color)
-        elif layout_type == "quote":
-            _build_quote_slide(slide, slide_data, title_color, accent_color)
-        elif layout_type == "bullets":
-            _build_bullets_slide(slide, slide_data, title_color, body_color, accent_color, image_path)
-        elif layout_type == "one_column":
-            _build_one_column_slide(slide, slide_data, title_color, body_color, accent_color)
-        elif layout_type == "two_column":
-            _build_two_column_slide(slide, slide_data, title_color, body_color, accent_color)
-        elif layout_type == "text_image":
-            _build_text_image_slide(slide, slide_data, title_color, body_color, accent_color, image_path)
-        elif layout_type == "image":
-            _build_image_slide(slide, slide_data, title_color, image_path)
-        elif layout_type == "icons":
-            _build_icons_slide(slide, slide_data, title_color, body_color, accent_color)
-        elif layout_type == "close":
-            _build_close_slide(slide, slide_data, title_color, accent_color)
-        else:
-            _build_bullets_slide(slide, slide_data, title_color, body_color, accent_color, image_path)
-
-        # Add footer to all slides
-        _add_footer(slide, position + 1, len(slides), is_blue or is_gradient)
-
-    output = io.BytesIO()
-    prs.save(output)
-    return output.getvalue()
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
 
 
-# ── Background helpers ──────────────────────────────────────────────
-
-def _set_solid_bg(slide, color: RGBColor):
-    background = slide.background
-    fill = background.fill
-    fill.solid()
-    fill.fore_color.rgb = color
-
-
-# ── Slide type builders ─────────────────────────────────────────────
-
-def _build_title_slide(slide, data, title_color, accent_color):
-    headline = data.get("headline", "")
-    subheadline = data.get("subheadline", "")
-
-    # Logo placeholder area (top left)
-    logo_path = ASSETS_DIR / "domo_logo_white.png"
-    if not logo_path.exists():
-        logo_path = ASSETS_DIR / "domo_logo_blue.png"
-    if logo_path.exists():
-        slide.shapes.add_picture(str(logo_path), Inches(0.5), Inches(0.4), height=Inches(0.45))
-
-    # Title — large centered
-    _add_text_box(slide, headline, Inches(0.8), Inches(2.2), Inches(11.7), Inches(1.5),
-                  font_size=Pt(44), bold=True, color=title_color, alignment=PP_ALIGN.LEFT)
-
-    # Subtitle
-    if subheadline:
-        _add_text_box(slide, subheadline, Inches(0.8), Inches(3.8), Inches(9), Inches(0.8),
-                      font_size=Pt(20), color=accent_color, alignment=PP_ALIGN.LEFT)
-
-    # Accent line
-    _add_line(slide, Inches(0.8), Inches(3.5), Inches(3), Pt(3), accent_color)
+def _clear_slides(prs: Presentation):
+    """Remove all existing slides from the presentation (keep layouts only)."""
+    sldIdLst = prs.slides._sldIdLst
+    while len(sldIdLst):
+        rId = sldIdLst[0].get(qn('r:id'))
+        if rId:
+            prs.part.drop_rel(rId)
+        del sldIdLst[0]
 
 
-def _build_section_slide(slide, data, title_color, accent_color):
-    headline = data.get("headline", "")
-    subheadline = data.get("subheadline", "")
+def _populate_slide(slide, data: Dict, slide_type: str, layout_idx: int, image_path: Optional[str]):
+    """Populate a slide's placeholders based on its type."""
+    phs = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
 
-    _add_text_box(slide, headline.upper(), Inches(1), Inches(2.5), Inches(11), Inches(1.5),
-                  font_size=Pt(40), bold=True, color=title_color, alignment=PP_ALIGN.CENTER)
+    if slide_type == "title":
+        _populate_title(phs, data)
+    elif slide_type == "section":
+        _populate_section(phs, data)
+    elif slide_type in ("quote",):
+        _populate_quote(phs, data, layout_idx)
+    elif slide_type == "bullets":
+        _populate_bullets(phs, data)
+    elif slide_type in ("one_column", "paragraph"):
+        _populate_one_column(phs, data)
+    elif slide_type in ("two_column", "emphasis_2col"):
+        _populate_two_column(phs, data)
+    elif slide_type in ("text_image", "large_image", "text_landscape",
+                         "phone_mockup", "screen_mockup", "intro_image"):
+        _populate_text_image(phs, data, image_path)
+    elif slide_type == "emphasis":
+        _populate_emphasis(phs, data)
+    elif slide_type in ("icons_1", "icons_2", "icons_3",
+                         "icons_1_desc", "icons_2_desc", "icons_3_desc"):
+        _populate_icons(phs, data, slide_type)
+    elif slide_type == "agenda":
+        _populate_agenda(phs, data, image_path)
+    elif slide_type == "close":
+        _populate_close(phs, data)
+    else:
+        # Fallback: try to populate whatever placeholders exist
+        _populate_generic(phs, data)
 
-    if subheadline:
-        _add_text_box(slide, subheadline, Inches(2), Inches(4.2), Inches(9), Inches(0.7),
-                      font_size=Pt(18), color=accent_color, alignment=PP_ALIGN.CENTER)
+    # Add speaker notes if provided
+    notes = data.get("speaker_notes", "")
+    if notes and hasattr(slide, 'notes_slide'):
+        try:
+            notes_slide = slide.notes_slide
+            notes_slide.notes_text_frame.text = notes
+        except Exception:
+            pass
 
 
-def _build_quote_slide(slide, data, title_color, accent_color):
+# ── Title (layouts 0, 1, 2) ────────────────────────────────────────
+# PH0=title, PH13=description, PH14=date/notes
+
+def _populate_title(phs, data):
+    _set_ph(phs, 0, data.get("headline", ""))
+    _set_ph(phs, 13, data.get("subheadline", ""))
+    _set_ph(phs, 14, data.get("body", ""))  # date/notes line
+
+
+# ── Section (layouts 3, 4, 5) ──────────────────────────────────────
+# PH0=title, PH13=description
+
+def _populate_section(phs, data):
+    _set_ph(phs, 0, data.get("headline", ""))
+    _set_ph(phs, 13, data.get("subheadline", ""))
+
+
+# ── Quote (layouts 10, 11) ─────────────────────────────────────────
+# PH0=quote text, PH20=attribution
+
+def _populate_quote(phs, data, layout_idx):
     quote = data.get("quote", data.get("body", ""))
-    attribution = data.get("quote_attribution", "")
-
-    # Large quote mark
-    _add_text_box(slide, "\u201C", Inches(1), Inches(1.5), Inches(2), Inches(1.5),
-                  font_size=Pt(96), color=accent_color, bold=True)
-
-    # Quote text
-    _add_text_box(slide, quote, Inches(1.5), Inches(2.5), Inches(10), Inches(2.5),
-                  font_size=Pt(24), color=title_color, italic=True)
-
-    # Attribution
-    if attribution:
-        _add_text_box(slide, attribution, Inches(1.5), Inches(5.2), Inches(10), Inches(0.5),
-                      font_size=Pt(14), color=accent_color)
+    # Add smart quotes
+    if quote and not quote.startswith("\u201C"):
+        quote = f"\u201C{quote}\u201D"
+    _set_ph(phs, 0, quote)
+    _set_ph(phs, 20, data.get("quote_attribution", ""))
 
 
-def _build_bullets_slide(slide, data, title_color, body_color, accent_color, image_path=None):
-    headline = data.get("headline", "")
-    subheadline = data.get("subheadline", "")
+# ── Bullets (layout 12) ────────────────────────────────────────────
+# PH0=title, PH10=bullets (multi-paragraph)
+
+def _populate_bullets(phs, data):
+    _set_ph(phs, 0, data.get("headline", ""))
     bullets = data.get("bullets", [])
-
-    # Accent bar on left
-    _add_rect(slide, Inches(0.4), Inches(0.4), Pt(4), Inches(0.8), accent_color)
-
-    # Headline
-    _add_text_box(slide, headline, Inches(0.7), Inches(0.35), Inches(11), Inches(0.75),
-                  font_size=Pt(28), bold=True, color=title_color)
-
-    if subheadline:
-        _add_text_box(slide, subheadline, Inches(0.7), Inches(1.15), Inches(10), Inches(0.5),
-                      font_size=Pt(14), color=GRAY)
-
-    # Bullets
-    content_width = Inches(7) if image_path else Inches(11)
-    bullet_top = Inches(1.9) if subheadline else Inches(1.5)
-
-    if bullets:
-        tf_shape = slide.shapes.add_textbox(Inches(0.7), bullet_top, content_width, Inches(4.5))
-        tf = tf_shape.text_frame
-        tf.word_wrap = True
+    if bullets and 10 in phs:
+        tf = phs[10].text_frame
+        tf.clear()
         for i, bullet in enumerate(bullets):
+            if i == 0:
+                p = tf.paragraphs[0]
+            else:
+                p = tf.add_paragraph()
+            p.text = bullet
+            # Inherit formatting from the placeholder's default style
+    elif data.get("body") and 10 in phs:
+        phs[10].text_frame.text = data["body"]
+
+
+# ── One Column (layout 13) ─────────────────────────────────────────
+# PH0=title, PH1=body
+
+def _populate_one_column(phs, data):
+    _set_ph(phs, 0, data.get("headline", ""))
+    body = data.get("body", "")
+    if not body and data.get("bullets"):
+        body = "\n".join(data["bullets"])
+    _set_ph(phs, 1, body)
+
+
+# ── Two Column (layouts 15, 20) ────────────────────────────────────
+# PH0=title, PH1=left column, PH10=right column
+
+def _populate_two_column(phs, data):
+    _set_ph(phs, 0, data.get("headline", ""))
+    bullets = data.get("bullets", [])
+    if bullets:
+        mid = max(len(bullets) // 2, 1)
+        _set_ph(phs, 1, "\n".join(bullets[:mid]))
+        _set_ph(phs, 10, "\n".join(bullets[mid:]))
+    elif data.get("body"):
+        sentences = [s.strip() for s in data["body"].split(". ") if s.strip()]
+        mid = max(len(sentences) // 2, 1)
+        _set_ph(phs, 1, ". ".join(sentences[:mid]) + ".")
+        _set_ph(phs, 10, ". ".join(sentences[mid:]))
+
+
+# ── Text + Image (layouts 16, 17) ──────────────────────────────────
+# PH0=title, PH1=text, PH11=picture
+
+def _populate_text_image(phs, data, image_path):
+    _set_ph(phs, 0, data.get("headline", ""))
+    body = data.get("body", "")
+    if not body and data.get("bullets"):
+        body = "\n".join(data["bullets"])
+    _set_ph(phs, 1, body)
+
+    if image_path and Path(image_path).exists() and 11 in phs:
+        try:
+            phs[11].insert_picture(image_path)
+        except Exception:
+            pass
+
+
+# ── Emphasis / Blue (layout 18) ────────────────────────────────────
+# PH0=title, PH12=body
+
+def _populate_emphasis(phs, data):
+    _set_ph(phs, 0, data.get("headline", ""))
+    body = data.get("body", "")
+    if not body and data.get("bullets"):
+        body = "\n".join(f"\u2022 {b}" for b in data["bullets"])
+    _set_ph(phs, 12, body)
+
+
+# ── Icons (layouts 23, 24, 25) ──────────────────────────────────────
+# Layout 23 (1 icon): PH0=title, PH17=icon title, PH18=icon text, PH19=icon image
+# Layout 24 (2 icons): + PH20=title2, PH21=text2, PH22=image2
+# Layout 25 (3 icons): + PH23=title3, PH24=text3, PH25=image3
+#   NOTE: Layout 25 ordering is: PH23/24/25=LEFT, PH17/18/19=CENTER, PH20/21/22=RIGHT
+
+def _populate_icons(phs, data, slide_type):
+    _set_ph(phs, 0, data.get("headline", ""))
+    points = data.get("icon_points", [])
+    if not points and data.get("bullets"):
+        points = [{"label": b[:30], "description": b} for b in data["bullets"][:3]]
+
+    # icons_1 and icons_1_desc share the same placeholder structure
+    if slide_type in ("icons_1", "icons_1_desc") and len(points) >= 1:
+        _set_ph(phs, 17, points[0].get("label", ""))
+        _set_ph(phs, 18, points[0].get("description", ""))
+    elif slide_type in ("icons_2", "icons_2_desc") and len(points) >= 2:
+        _set_ph(phs, 17, points[0].get("label", ""))
+        _set_ph(phs, 18, points[0].get("description", ""))
+        _set_ph(phs, 20, points[1].get("label", ""))
+        _set_ph(phs, 21, points[1].get("description", ""))
+    elif slide_type in ("icons_3", "icons_3_desc") and len(points) >= 3:
+        # Layout 25/28: PH23/24/25=LEFT, PH17/18/19=CENTER, PH20/21/22=RIGHT
+        _set_ph(phs, 23, points[0].get("label", ""))
+        _set_ph(phs, 24, points[0].get("description", ""))
+        _set_ph(phs, 17, points[1].get("label", ""))
+        _set_ph(phs, 18, points[1].get("description", ""))
+        _set_ph(phs, 20, points[2].get("label", ""))
+        _set_ph(phs, 21, points[2].get("description", ""))
+
+
+# ── Agenda (layout 52) ─────────────────────────────────────────────
+# PH0=title, PH1=body, PH13=image
+
+def _populate_agenda(phs, data, image_path):
+    _set_ph(phs, 0, data.get("headline", ""))
+    body = data.get("body", "")
+    if not body and data.get("bullets"):
+        body = "\n".join(data["bullets"])
+    _set_ph(phs, 1, body)
+    if image_path and Path(image_path).exists() and 13 in phs:
+        try:
+            phs[13].insert_picture(image_path)
+        except Exception:
+            pass
+
+
+# ── Close (layouts 31, 32) ─────────────────────────────────────────
+
+def _populate_close(phs, data):
+    _set_ph(phs, 0, data.get("headline", "Thank You"))
+
+
+# ── Generic fallback ────────────────────────────────────────────────
+
+def _populate_generic(phs, data):
+    """Try to populate any available placeholders with whatever content we have."""
+    _set_ph(phs, 0, data.get("headline", ""))
+    _set_ph(phs, 1, data.get("body", ""))
+    if data.get("bullets") and 10 in phs:
+        tf = phs[10].text_frame
+        tf.clear()
+        for i, b in enumerate(data["bullets"]):
             p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-            p.space_before = Pt(8)
-            run = p.add_run()
-            run.text = f"\u2022  {bullet}"
-            run.font.size = Pt(16)
-            run.font.color.rgb = body_color
-            run.font.name = FONT_NAME
-
-    # Optional image on right
-    if image_path and Path(image_path).exists():
-        slide.shapes.add_picture(image_path, Inches(8.2), Inches(1.5), width=Inches(4.5))
+            p.text = b
+    _set_ph(phs, 13, data.get("subheadline", ""))
 
 
-def _build_one_column_slide(slide, data, title_color, body_color, accent_color):
-    headline = data.get("headline", "")
-    body = data.get("body", "")
+# ── Helper ──────────────────────────────────────────────────────────
 
-    _add_rect(slide, Inches(0.4), Inches(0.4), Pt(4), Inches(0.8), accent_color)
-    _add_text_box(slide, headline, Inches(0.7), Inches(0.35), Inches(11), Inches(0.75),
-                  font_size=Pt(28), bold=True, color=title_color)
-
-    if body:
-        _add_text_box(slide, body, Inches(0.7), Inches(1.6), Inches(11.5), Inches(4.5),
-                      font_size=Pt(16), color=body_color, line_spacing=Pt(28))
-
-
-def _build_two_column_slide(slide, data, title_color, body_color, accent_color):
-    headline = data.get("headline", "")
-    bullets = data.get("bullets", [])
-    body = data.get("body", "")
-
-    _add_rect(slide, Inches(0.4), Inches(0.4), Pt(4), Inches(0.8), accent_color)
-    _add_text_box(slide, headline, Inches(0.7), Inches(0.35), Inches(11), Inches(0.75),
-                  font_size=Pt(28), bold=True, color=title_color)
-
-    # Split bullets into two columns
-    if bullets:
-        mid = len(bullets) // 2 or 1
-        left_bullets = bullets[:mid]
-        right_bullets = bullets[mid:]
-
-        _add_bullet_list(slide, left_bullets, Inches(0.7), Inches(1.6), Inches(5.5), Inches(4.5), body_color)
-        _add_bullet_list(slide, right_bullets, Inches(6.8), Inches(1.6), Inches(5.5), Inches(4.5), body_color)
-
-        # Vertical divider
-        _add_rect(slide, Inches(6.55), Inches(1.6), Pt(1), Inches(4.5), BORDER)
-    elif body:
-        # Split body text
-        sentences = body.split(". ")
-        mid = len(sentences) // 2
-        left_text = ". ".join(sentences[:mid]) + "."
-        right_text = ". ".join(sentences[mid:])
-        _add_text_box(slide, left_text, Inches(0.7), Inches(1.6), Inches(5.5), Inches(4.5),
-                      font_size=Pt(14), color=body_color)
-        _add_text_box(slide, right_text, Inches(6.8), Inches(1.6), Inches(5.5), Inches(4.5),
-                      font_size=Pt(14), color=body_color)
-
-
-def _build_text_image_slide(slide, data, title_color, body_color, accent_color, image_path=None):
-    headline = data.get("headline", "")
-    body = data.get("body", "")
-    bullets = data.get("bullets", [])
-
-    _add_rect(slide, Inches(0.4), Inches(0.4), Pt(4), Inches(0.8), accent_color)
-    _add_text_box(slide, headline, Inches(0.7), Inches(0.35), Inches(6), Inches(0.75),
-                  font_size=Pt(28), bold=True, color=title_color)
-
-    if bullets:
-        _add_bullet_list(slide, bullets, Inches(0.7), Inches(1.6), Inches(5.5), Inches(4.5), body_color)
-    elif body:
-        _add_text_box(slide, body, Inches(0.7), Inches(1.6), Inches(5.5), Inches(4.5),
-                      font_size=Pt(14), color=body_color)
-
-    if image_path and Path(image_path).exists():
-        slide.shapes.add_picture(image_path, Inches(7), Inches(0.8), width=Inches(5.8))
-
-
-def _build_image_slide(slide, data, title_color, image_path=None):
-    headline = data.get("headline", "")
-
-    if image_path and Path(image_path).exists():
-        slide.shapes.add_picture(image_path, Inches(0), Inches(0), width=SW)
-
-    # Caption overlay at bottom
-    if headline:
-        _add_text_box(slide, headline, Inches(0.5), Inches(6.2), Inches(12), Inches(0.7),
-                      font_size=Pt(18), color=title_color, bold=True)
-
-
-def _build_icons_slide(slide, data, title_color, body_color, accent_color):
-    headline = data.get("headline", "")
-    icon_points = data.get("icon_points", [])
-
-    _add_rect(slide, Inches(0.4), Inches(0.4), Pt(4), Inches(0.8), accent_color)
-    _add_text_box(slide, headline, Inches(0.7), Inches(0.35), Inches(11), Inches(0.75),
-                  font_size=Pt(28), bold=True, color=title_color)
-
-    if not icon_points:
-        return
-
-    # Layout icons evenly across the slide
-    count = min(len(icon_points), 3)
-    col_width = 11 / count
-    icon_symbols = ["\u25CF", "\u25B2", "\u25A0"]  # circle, triangle, square
-
-    for i, point in enumerate(icon_points[:3]):
-        x = Inches(0.7 + i * col_width)
-        y_icon = Inches(2.2)
-        y_label = Inches(3.5)
-        y_desc = Inches(4.1)
-
-        # Icon placeholder (colored circle)
-        icon_shape = slide.shapes.add_shape(
-            MSO_SHAPE.OVAL, x + Inches(col_width/2 - 0.4), y_icon, Inches(0.8), Inches(0.8)
-        )
-        icon_shape.fill.solid()
-        icon_shape.fill.fore_color.rgb = accent_color
-        icon_shape.line.fill.background()
-
-        # Label
-        label = point.get("label", f"Point {i+1}")
-        _add_text_box(slide, label, x, y_label, Inches(col_width - 0.2), Inches(0.5),
-                      font_size=Pt(16), bold=True, color=title_color, alignment=PP_ALIGN.CENTER)
-
-        # Description
-        desc = point.get("description", "")
-        if desc:
-            _add_text_box(slide, desc, x, y_desc, Inches(col_width - 0.2), Inches(1.5),
-                          font_size=Pt(12), color=body_color, alignment=PP_ALIGN.CENTER)
-
-
-def _build_close_slide(slide, data, title_color, accent_color):
-    headline = data.get("headline", "Thank You")
-    subheadline = data.get("subheadline", "")
-
-    _add_text_box(slide, headline, Inches(1), Inches(2.5), Inches(11), Inches(1.5),
-                  font_size=Pt(44), bold=True, color=title_color, alignment=PP_ALIGN.CENTER)
-
-    if subheadline:
-        _add_text_box(slide, subheadline, Inches(2), Inches(4.2), Inches(9), Inches(0.7),
-                      font_size=Pt(18), color=accent_color, alignment=PP_ALIGN.CENTER)
-
-    # Accent line
-    _add_line(slide, Inches(5.5), Inches(4.0), Inches(2.3), Pt(3), accent_color)
-
-
-# ── Shared helpers ──────────────────────────────────────────────────
-
-def _add_text_box(slide, text, left, top, width, height,
-                  font_size=Pt(14), bold=False, italic=False,
-                  color=DARK_TEXT, alignment=PP_ALIGN.LEFT, line_spacing=None):
-    box = slide.shapes.add_textbox(left, top, width, height)
-    tf = box.text_frame
-    tf.word_wrap = True
-    p = tf.paragraphs[0]
-    p.alignment = alignment
-    if line_spacing:
-        p.line_spacing = line_spacing
-    run = p.add_run()
-    run.text = text
-    run.font.size = font_size
-    run.font.bold = bold
-    run.font.italic = italic
-    run.font.color.rgb = color
-    run.font.name = FONT_NAME
-    return box
-
-
-def _add_bullet_list(slide, items, left, top, width, height, color):
-    box = slide.shapes.add_textbox(left, top, width, height)
-    tf = box.text_frame
-    tf.word_wrap = True
-    for i, item in enumerate(items):
-        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.space_before = Pt(8)
-        run = p.add_run()
-        run.text = f"\u2022  {item}"
-        run.font.size = Pt(15)
-        run.font.color.rgb = color
-        run.font.name = FONT_NAME
-
-
-def _add_rect(slide, left, top, width, height, color):
-    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
-    shape.fill.solid()
-    shape.fill.fore_color.rgb = color
-    shape.line.fill.background()
-    return shape
-
-
-def _add_line(slide, left, top, width, height, color):
-    return _add_rect(slide, left, top, width, height, color)
-
-
-def _add_footer(slide, page_num, total_pages, light_text=False):
-    text_color = WHITE if light_text else GRAY
-    line_color = RGBColor(0xFF, 0xFF, 0xFF) if light_text else BORDER
-
-    # Bottom line
-    _add_rect(slide, Inches(0.4), Inches(6.9), Inches(12.5), Pt(1), line_color)
-
-    # Logo text
-    _add_text_box(slide, "DOMO", Inches(0.4), Inches(7.0), Inches(1.5), Inches(0.3),
-                  font_size=Pt(9), bold=True, color=text_color)
-
-    # Tagline
-    _add_text_box(slide, "The AI and Data Products Platform", Inches(1.5), Inches(7.0), Inches(4), Inches(0.3),
-                  font_size=Pt(8), color=text_color)
-
-    # Page number
-    _add_text_box(slide, f"{page_num}", Inches(12), Inches(7.0), Inches(1), Inches(0.3),
-                  font_size=Pt(9), color=text_color, alignment=PP_ALIGN.RIGHT)
-
-    # Confidential
-    _add_text_box(slide, "Confidential", Inches(10), Inches(7.0), Inches(2), Inches(0.3),
-                  font_size=Pt(8), color=text_color, alignment=PP_ALIGN.RIGHT)
+def _set_ph(phs: Dict[int, Any], idx: int, text: str):
+    """Set a placeholder's text if it exists and text is non-empty."""
+    if idx in phs and text:
+        phs[idx].text_frame.text = text
