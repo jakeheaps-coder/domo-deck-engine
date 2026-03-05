@@ -26,11 +26,12 @@ class CritiqueResult(BaseModel):
     fixes: List[SlideFix] = Field(default_factory=list)
 
 
-CRITIQUE_PROMPT = """You are a {audience} member reviewing a presentation titled "{title}".
+CRITIQUE_PROMPT = """You are a senior {audience} member — demanding, time-constrained, and allergic
+to fluff. You are reviewing a presentation titled "{title}".
 Purpose: {purpose}
 Tone expected: {tone}
 
-You are sitting in the meeting. Critique this deck honestly and specifically.
+You have 30 minutes. Every slide must earn its place. Critique this deck ruthlessly.
 
 SLIDES:
 {slides_json}
@@ -38,34 +39,52 @@ SLIDES:
 KEY MESSAGES THE PRESENTER WANTS TO LAND:
 {key_messages}
 
-EVALUATE EACH SLIDE FOR:
-1. FLOW: Does the deck tell a coherent story? Clear narrative arc?
-2. CLARITY: Is each slide's message immediately clear? Any jargon?
-3. EVIDENCE: Are claims backed by data? Unsupported assertions?
-4. CONCISENESS: Too wordy? Headlines too long (max 8 words)?
-5. KEY MESSAGES: Do the key messages come through clearly?
-6. MISSING: Anything this audience would expect to see?
-7. REDUNDANCY: Any slides repetitive or unnecessary?
+EVALUATE WITH ZERO TOLERANCE:
+
+1. EMPTY OR PLACEHOLDER CONTENT — Any slide with generic text like "Enter text",
+   "Click to edit", empty headlines, or vague language is an automatic HIGH severity fix.
+   Rewrite it with specific, relevant content.
+
+2. HEADLINE TEST — Read ONLY the headlines in sequence. Do they tell the complete story?
+   If not, rewrite the weak ones as complete takeaways with data.
+   BAD: "Q1 Performance" → GOOD: "Q1 Revenue Grew 23% to $142M"
+   BAD: "Achieve Growth" → GOOD: "Enterprise Grew 34% YoY"
+
+3. NARRATIVE ARC — Opening sets context → Body builds evidence → Climax delivers insight → Close has clear next step. Flag any gaps.
+
+4. SPECIFICITY — Every claim needs a number. "Strong growth" → "34% YoY growth".
+   "Good retention" → "94.2% gross retention". Flag vague slides.
+
+5. KEY MESSAGE COVERAGE — Each key message MUST appear as a headline.
+   If a key message is missing, flag it as HIGH and write the missing slide content.
+
+6. REDUNDANCY — Merge or cut any slides that repeat the same point.
+
+7. FILLER — Section breaks without purpose, slides with only a headline and no
+   supporting content, "Thank You" slides with no next step — flag all of these.
 
 Return JSON:
 {{
   "overall_score": <1-10>,
-  "summary": "<2-3 sentence overall assessment>",
+  "summary": "<2-3 sentence assessment>",
   "fixes": [
     {{
       "slide_position": <int>,
-      "issue": "<what's wrong>",
-      "fix": "<what to do>",
+      "issue": "<specific problem>",
+      "fix": "<specific action>",
       "severity": "high" or "medium",
-      "new_headline": "<rewritten headline or null>",
-      "new_bullets": ["<rewritten bullets>"] or null,
-      "new_body": "<rewritten body or null>",
-      "new_subheadline": "<rewritten subheadline or null>"
+      "new_headline": "<rewritten headline with data>" or null,
+      "new_bullets": ["<specific, rewritten bullets>"] or null,
+      "new_body": "<rewritten body text>" or null,
+      "new_subheadline": "<rewritten subheadline>" or null
     }}
   ]
 }}
 
-Only return HIGH and MEDIUM severity issues. Give exact rewrites, not vague suggestions."""
+Rules:
+- Only HIGH and MEDIUM severity. Be specific — exact rewrites, not suggestions.
+- For empty slides, write the FULL replacement content (headline + bullets or body).
+- Use the actual data from the talking points and key messages in your rewrites."""
 
 
 def critique_deck(
